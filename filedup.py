@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from collections import defaultdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 
 class Progressbar:
@@ -90,30 +90,15 @@ class FileDup:
     """ Main app class """
     paths: List[str]
     files: List[str]
-    total_size: int
     progress: bool
     progressbar: Optional[Progressbar] = None
     filters: List[FileFilter]
 
     files_by_size: Dict[int, List[str]]
-    file_hashes: Dict[str, str]
-    dup: Dict[str, List[str]]
+    potential_dup: Dict[Tuple[str, int], List[str]]
+    dup: Dict[Tuple[str, int], List[str]]
 
-    def _check_file_filters(self, file_path: str) -> bool:
-        return not all(f.check(file_path) for f in self.filters)
-
-    def _find_files_in_path(self, path):
-        """ Process path """
-        try:
-            if os.path.isfile(path) or os.path.islink(path):
-                self.total_size += os.stat(path).st_size
-                if self._check_file_filters(path):
-                    self.files.append(path)
-            elif os.path.isdir(path):
-                for sub_path in os.listdir(path):
-                    self._find_files_in_path(os.path.join(path, sub_path))
-        except OSError as err:
-            print(err, file=sys.stderr)
+    _hash_count_left: int = 0
 
     def __init__(
         self,
@@ -126,37 +111,100 @@ class FileDup:
         self.filters = filters
         self.paths = paths
         self.files_by_size = {}
-        self.file_hashes = {}
         self.dup = {}
         self.progress = progress
 
-    def _hash(self, file) -> str:
+    def _check_file_filters(self, file_path: str) -> bool:
+        return all(f.check(file_path) for f in self.filters)
+
+    def _find_files_in_path(self, path):
+        """ Process path """
+        try:
+            if os.path.isfile(path) or os.path.islink(path):
+                if self._check_file_filters(path):
+                    self.files.append(path)
+            elif os.path.isdir(path):
+                for sub_path in os.listdir(path):
+                    self._find_files_in_path(os.path.join(path, sub_path))
+        except OSError as err:
+            print(err, file=sys.stderr)
+
+    def _prb_nl(self):
+        if self.progress:
+            print()
+
+    def _prb_add(self, inc=1):
+        if self.progress:
+            self.progressbar.add(inc)
+
+    def _hash(self, file, size) -> str:
         """ Compute or return file hash """
+        self._hash_count_left = size
         md5 = hashlib.md5()
         with open(file, 'rb') as f:
             for b in iter(lambda: f.read(4096), b''):
-                if self.progressbar is not None:
-                    self.progressbar.add(len(b))
+                ln = len(b)
+                self._prb_add(ln)
+                self._hash_count_left -= ln
                 md5.update(b)
 
         return md5.hexdigest()
 
-    def _process_file(self, file_path):
-        """ Process file """
-
-
     def run(self, script: bool, print_hash: bool):
         """ App body """
         self.files_by_size = defaultdict(list)
-        self.file_hashes = {}
-        self.dup = defaultdict(list)
+        self.potential_dup = defaultdict(list)
+        self.files = []
 
-        # Compute
+        # Find files in paths
+        for path in self.paths:
+            self._find_files_in_path(path)
+
+        # Sort file by their sizes
+        if self.progress:
+            self.progressbar = Progressbar(
+                'Getting file sizes',
+                len(self.files),
+            )
         for file in self.files:
             try:
-                self._process_file(file)
+                self.files_by_size[os.path.getsize(file)].append(file)
             except OSError as err:
+                self._prb_nl()
                 print(err, file=sys.stderr)
+            finally:
+                self._prb_add()
+
+        # Get file sizes with potential duplicates
+        dups_sizes = list(
+            size for size in self.files_by_size
+            if len(self.files_by_size[size]) > 1
+        )
+        # Count potential dup sizes for a new progessbar
+        self._prb_nl()
+        if self.progress:
+            self.progressbar = Progressbar(
+                'Finding duplicates',
+                sum(size*len(self.files_by_size[size]) for size in dups_sizes),
+            )
+
+        # Sort potential dups by size and hash
+        for size in dups_sizes:
+            for file in self.files_by_size[size]:
+                try:
+                    hash_sum = self._hash(file, size)
+                    self.potential_dup[hash_sum, size].append(file)
+                except OSError as err:
+                    print(err, file=sys.stderr)
+                    self._prb_add(self._hash_count_left)
+
+        # Filter-out non-dups
+        self.dup = dict(
+            filter(
+                lambda v: len(v[1]) > 1,
+                self.potential_dup.items(),
+            ),
+        )
 
         # Output
         if self.progressbar is not None:
@@ -212,7 +260,7 @@ def main():
         app = FileDup(paths=args.path, progress=args.progress, filters=filters)
         app.run(script=args.script, print_hash=args.print_hash)
     except KeyboardInterrupt:
-        print('Interrupted')
+        print('\nInterrupted')
 
 
 main()
